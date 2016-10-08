@@ -10,6 +10,7 @@
 
 #include "kernels.cuh"
 #include "edge.cuh"
+#include "neuron.cuh"
 
 
 		 int main()
@@ -25,33 +26,55 @@
 	int numThreads = 512;
 
 	/* Neurons */
-	float *h_v, *d_v, *h_u, *d_u, *h_I, *d_I, *h_driven, *d_driven;
+
+	Neuron *h_neurons, *d_neurons;
+
+	float *h_I, *d_I, *h_driven, *d_driven;
 	bool *d_cf, *h_cf;
 
-	h_v = new float[numNeurons];
-	h_u = new float[numNeurons];
+	float *d_inputs;
+
+	float *d_v;
+
+	h_neurons = new Neuron[numNeurons];
 	h_I = new float[numNeurons*maxDelay];
 	h_cf = new bool[numNeurons];
 	h_driven = new float[numNeurons];
 
+	float *h_drivenZero = new float[numNeurons];
+	float *d_drivenZero;
+
 	bool **SpikeTrainYard = new bool*[T];
 	float **VoltageTrace = new float *[T];
+	float **InputTrace = new float*[T];
+
 	for (int i = 0; i < numNeurons; i++)
 	{
 		for (int j = 0; j < maxDelay; j++)
 		{
 			h_I[i*maxDelay + j] = 0;
 		}
-		h_v[i] = -60;
-		h_u[i] = 0;
+
+		if (i < numExcit)
+		{
+			h_neurons[i].setRegSpike();
+		}
+		else
+		{
+			h_neurons[i].setIntBurst();
+		}
+
 		h_cf[i] = false;
+
 		if (i < 100)
 		{
 			h_driven[i] = 100;
+			h_drivenZero[i] = 0;
 		}
 		else
 		{
 			h_driven[i] = 0;
+			h_drivenZero[i] = 0;
 		}
 	}
 
@@ -59,6 +82,7 @@
 	{
 		SpikeTrainYard[t] = new bool[numNeurons];
 		VoltageTrace[t] = new float[numNeurons];
+		InputTrace[t] = new float[numNeurons];
 	}
 
 
@@ -79,22 +103,26 @@
 		{
 			if (n != m)
 			{
-
-				if (dist(rd) < .2)
+				if (n < numExcit)
 				{
-					d = intDist(rd);
-					if (n < numExcit)
+					if (dist(rd) < .15)
 					{
-						w = dist(rd) * 300;
+						d = intDist(rd);
+						w = dist(rd) * 150;
+						Edge e(n, m, d, w);
+						h_edges.push_back(e);
 					}
-					else
-					{
-						w = dist(rd) * -400;
-					}
-					Edge e(n,m,d,w);
-					h_edges.push_back(e);
 				}
-
+				else
+				{
+					if (dist(rd) < .3)
+					{
+						d = intDist(rd);
+						w = dist(rd) * -400;
+						Edge e(n, m, d, w);
+						h_edges.push_back(e);
+					}
+				}
 			}
 		}
 	}
@@ -103,20 +131,22 @@
 
 	/* CUDA Memory Functions */
 
-	cudaMalloc((void**)&d_v, numNeurons * sizeof(float));
-	cudaMalloc((void**)&d_u, numNeurons * sizeof(float));
+	cudaMalloc((void**)&d_neurons, numNeurons * sizeof(Neuron));
 	cudaMalloc((void**)&d_I, numNeurons * maxDelay * sizeof(float));
 	cudaMalloc((void**)&d_driven, numNeurons * sizeof(float));
 	cudaMalloc((void**)&d_cf, numNeurons * sizeof(bool));
+	cudaMalloc((void**)&d_v, numNeurons * sizeof(float));
+	cudaMalloc((void**)&d_inputs, numNeurons * sizeof(float));
+	cudaMalloc((void**)&d_drivenZero, numNeurons * sizeof(float));
 
 
 	cudaMalloc((void**)&d_edges, numEdges * sizeof(Edge));
 
 
-	cudaMemcpy(d_v, h_v, numNeurons * sizeof(float), cudaMemcpyHostToDevice);
-	cudaMemcpy(d_u, h_u, numNeurons * sizeof(float), cudaMemcpyHostToDevice);
-	cudaMemcpy(d_I, h_I, numNeurons * sizeof(float), cudaMemcpyHostToDevice);
+	cudaMemcpy(d_neurons, h_neurons, numNeurons * sizeof(Neuron), cudaMemcpyHostToDevice);
+	cudaMemcpy(d_I, h_I, numNeurons * maxDelay * sizeof(float), cudaMemcpyHostToDevice);
 	cudaMemcpy(d_driven, h_driven, numNeurons * sizeof(float), cudaMemcpyHostToDevice);
+	cudaMemcpy(d_drivenZero, h_drivenZero, numNeurons * sizeof(float), cudaMemcpyHostToDevice);
 
 	cudaMemcpy(d_edges, h_edges.data(), numEdges * sizeof(Edge), cudaMemcpyHostToDevice);
 
@@ -129,13 +159,14 @@
 		NeuronTimestep << <(numNeurons + numThreads - 1) / numThreads, numThreads >> >(
 			numNeurons,
 			numExcit,
-			d_v,
-			d_u,
+			d_neurons,
 			d_I,
 			d_cf,
-			d_driven,
+			d_drivenZero,
 			t,
-			maxDelay);
+			maxDelay,
+			d_v,
+			d_inputs);
 	}
 
 	for (int t = 0; t < transientTime; t++)
@@ -144,13 +175,14 @@
 		NeuronTimestep << <(numNeurons + numThreads - 1) / numThreads, numThreads >> >(
 			numNeurons,
 			numExcit,
-			d_v,
-			d_u,
+			d_neurons,
 			d_I,
 			d_cf,
-			d_driven,
+			d_drivenZero,
 			t,
-			maxDelay);
+			maxDelay,
+			d_v,
+			d_inputs);
 
 		CommunicationPhase << <(numEdges + numThreads - 1) / numThreads, numThreads >> >(
 			numEdges,
@@ -168,13 +200,14 @@
 		NeuronTimestep << <(numNeurons + numThreads - 1) / numThreads, numThreads >> >(
 			numNeurons,
 			numExcit,
-			d_v,
-			d_u,
+			d_neurons,
 			d_I,
 			d_cf,
 			d_driven,
 			t,
-			maxDelay);
+			maxDelay,
+			d_v,
+			d_inputs);
 
 		CommunicationPhase << <(numEdges + numThreads - 1) / numThreads, numThreads >> >(
 			numEdges,
@@ -186,6 +219,7 @@
 
 		cudaMemcpy(SpikeTrainYard[t], d_cf, numNeurons * sizeof(bool), cudaMemcpyDeviceToHost);
 		cudaMemcpy(VoltageTrace[t], d_v, numNeurons * sizeof(float), cudaMemcpyDeviceToHost);
+		cudaMemcpy(InputTrace[t], d_inputs, numNeurons * sizeof(float), cudaMemcpyDeviceToHost);
 	}
 
 
@@ -195,6 +229,7 @@
 
 	for (int t = 0; t < T; t++)
 	{
+		//std::cout << VoltageTrace[t][0] << "," << InputTrace[t][0] <<  std::endl;
 		for (int n = 0; n < numNeurons; n++)
 		{
 			if (SpikeTrainYard[t][n] == true)
@@ -218,9 +253,11 @@
 	{
 		delete[] SpikeTrainYard[t];
 		delete[] VoltageTrace[t];
+		delete[] InputTrace[t];
 	}
 
-	delete[] h_v; delete[] h_u; delete[] h_I; delete[] h_cf; delete[] SpikeTrainYard; delete[] h_driven;
+	delete[] h_neurons; delete[] h_I; delete[] h_cf; delete[] SpikeTrainYard; delete[] h_driven;
 	delete[] VoltageTrace;
+	delete[] InputTrace;
 	return 0;
 }
